@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+deepface
+opencv-python-headless
+numpy
+tensorflow-cpu
+psycopg2-binary
+python-multipart

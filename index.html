@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>E-TPMB Face ID - Production Ready</title>
+    <style>
+        body { font-family: system-ui, -apple-system, sans-serif; background-color: #f3f4f6; color: #1f2937; display: flex; flex-direction: column; align-items: center; padding: 2rem; margin: 0; }
+        h1 { margin-bottom: 0.5rem; }
+        p { color: #6b7280; margin-bottom: 2rem; }
+        .container { display: flex; gap: 2rem; max-width: 1000px; width: 100%; }
+        
+        /* Area Kamera yang Diperbarui */
+        .camera-section { flex: 1; display: flex; flex-direction: column; align-items: center; background: white; padding: 1rem; border-radius: 12px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); }
+        .camera-wrapper { position: relative; width: 100%; max-width: 480px; border-radius: 8px; overflow: hidden; background: #000; }
+        video { width: 100%; display: block; transform: scaleX(-1); /* Mirror effect */ }
+        canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; transform: scaleX(-1); pointer-events: none; }
+        
+        /* Overlay Instruksi */
+        .instruction-overlay { position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); background: rgba(0, 0, 0, 0.7); color: white; padding: 10px 20px; border-radius: 20px; font-weight: 600; font-size: 14px; text-align: center; width: 80%; z-index: 20; display: none; transition: background-color 0.3s; }
+        
+        .controls-section { flex: 1; display: flex; flex-direction: column; gap: 1.5rem; }
+        .card { background: white; padding: 1.5rem; border-radius: 12px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); }
+        h3 { margin-top: 0; margin-bottom: 1rem; color: #111827; }
+        input { width: 100%; padding: 0.75rem; margin-bottom: 1rem; border: 1px solid #d1d5db; border-radius: 6px; box-sizing: border-box; }
+        button { width: 100%; padding: 0.75rem; border: none; border-radius: 6px; font-weight: 600; color: white; cursor: pointer; transition: opacity 0.2s; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-primary { background-color: #2563eb; }
+        .btn-primary:hover:not(:disabled) { background-color: #1d4ed8; }
+        .btn-success { background-color: #059669; }
+        .btn-success:hover:not(:disabled) { background-color: #047857; }
+        .status-box { margin-top: 1rem; padding: 1rem; border-radius: 6px; background: #f8fafc; border: 1px solid #e2e8f0; font-family: monospace; white-space: pre-wrap; word-break: break-all; font-size: 14px; min-height: 80px; }
+    </style>
+</head>
+<body>
+
+    <h1>Sistem Face ID E-TPMB</h1>
+    <p>Purwarupa Pengenalan Wajah dengan Python FastAPI</p>
+
+    <div class="container">
+        <!-- Area Kamera -->
+        <div class="camera-section">
+            <div class="camera-wrapper">
+                <video id="video" autoplay muted playsinline></video>
+                <canvas id="canvas"></canvas>
+                <div id="instruction-overlay" class="instruction-overlay">Tatap layar untuk mulai...</div>
+            </div>
+            <small style="margin-top: 10px; color: #6b7280;">Pastikan wajah terlihat jelas dan pencahayaan cukup</small>
+        </div>
+
+        <!-- Area Kontrol -->
+        <div class="controls-section">
+            <!-- Flow 1: Pendaftaran -->
+            <div class="card">
+                <h3>1. Pendaftaran Pasien/Staf Baru</h3>
+                <input type="text" id="input-name" placeholder="Masukkan Nama Lengkap">
+                <button id="btn-register" class="btn-primary">📷 Registrasi 3 Tahap</button>
+            </div>
+
+            <!-- Flow 2: Pencarian / Identifikasi -->
+            <div class="card">
+                <h3>2. Identifikasi Wajah (Pencarian)</h3>
+                <button id="btn-recognize" class="btn-success">🔍 Mulai Pindai Wajah</button>
+            </div>
+
+            <!-- Log Output -->
+            <div class="card">
+                <h3>Log Sistem</h3>
+                <div id="log-output" class="status-box">Menunggu instruksi...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Pustaka face-api.js -->
+    <script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+    <script>
+        // DOM Elements
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const instructionOverlay = document.getElementById('instruction-overlay');
+        const btnRegister = document.getElementById('btn-register');
+        const btnRecognize = document.getElementById('btn-recognize');
+        const inputName = document.getElementById('input-name');
+        const logOutput = document.getElementById('log-output');
+
+        // Konfigurasi Sistem
+        const API_BASE_URL = '/api/v1';
+        const MODEL_URL = '/models';
+        const DETECTOR_OPTIONS = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.30 });
+        const MAX_REGISTRATION_TRIES = 300; // 300 iterasi x 80ms = ~24 detik maksimal
+        const EAR_CLOSED = 0.19;
+        const EAR_OPEN = 0.24;
+        const HEAD_MOVE_THRESHOLD = 0.08;
+        const SMILE_GAIN = 1.18;
+        const SMILE_MIN = 1.8;
+        const FACE_MISSING_GRACE_FRAMES = 12;
+        const FACE_RESET_FRAMES = 30;
+        const GUIDE_CENTER_TOLERANCE_X = 0.14;
+        const GUIDE_CENTER_TOLERANCE_Y = 0.18;
+        const GUIDE_MIN_FACE_WIDTH_RATIO = 0.34;
+        const GUIDE_MIN_FACE_HEIGHT_RATIO = 0.42;
+        const GUIDE_CHECK_MAX_TRIES = 30;
+        
+        let modelsReady = false;
+        let cameraReady = false;
+
+        function sleep(ms) {
+            return new Promise((resolve) => setTimeout(resolve, ms));
+        }
+
+        // 1. Inisialisasi Kamera
+        async function startCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+                video.srcObject = stream;
+                await new Promise((resolve) => {
+                    if (video.readyState >= 1) {
+                        resolve();
+                        return;
+                    }
+                    video.onloadedmetadata = () => resolve();
+                });
+                cameraReady = true;
+            } catch (err) {
+                logOutput.textContent = "Error: Kamera tidak dapat diakses.\n" + err.message;
+                logOutput.style.color = 'red';
+            }
+        }
+
+        async function loadFaceApiModels() {
+            await verifyFaceApiModelFiles();
+            await Promise.all([
+                faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL),
+                faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL)
+            ]);
+            modelsReady = true;
+        }
+
+        async function fetchManifest(manifestFile) {
+            const response = await fetch(`${MODEL_URL}/${manifestFile}`, { cache: 'no-store' });
+            if (!response.ok) {
+                throw new Error(`File model tidak ditemukan: ${manifestFile}`);
+            }
+            return response.json();
+        }
+
+        async function verifyFaceApiModelFiles() {
+            const manifests = [
+                'ssd_mobilenetv1_model-weights_manifest.json',
+                'face_landmark_68_model-weights_manifest.json'
+            ];
+            const missingFiles = [];
+
+            for (const manifestFile of manifests) {
+                const groups = await fetchManifest(manifestFile);
+                for (const group of groups) {
+                    const shardPaths = Array.isArray(group.paths) ? group.paths : [];
+                    for (const shardPath of shardPaths) {
+                        const shardUrl = `${MODEL_URL}/${shardPath}`;
+                        const shardResponse = await fetch(shardUrl, { method: 'HEAD', cache: 'no-store' });
+                        if (!shardResponse.ok) {
+                            missingFiles.push(shardPath);
+                        }
+                    }
+                }
+            }
+
+            if (missingFiles.length > 0) {
+                throw new Error(
+                    `File shard model belum lengkap: ${missingFiles.join(', ')}. ` +
+                    `Pastikan semua file shard face-api.js ada di folder /models.`
+                );
+            }
+        }
+
+        // 2. Helper: Tangkap Frame dari Video menjadi Blob
+        async function captureBlobOnce() {
+            if (!cameraReady || video.videoWidth === 0 || video.videoHeight === 0) {
+                throw new Error('Kamera belum siap.');
+            }
+            // Gunakan canvas temporer untuk memotret bersih (tanpa garis panduan)
+            const tempCanvas = document.createElement('canvas');
+            tempCanvas.width = video.videoWidth;
+            tempCanvas.height = video.videoHeight;
+            const ctx = tempCanvas.getContext('2d');
+            ctx.drawImage(video, 0, 0, tempCanvas.width, tempCanvas.height);
+            
+            return new Promise((resolve, reject) => {
+                tempCanvas.toBlob((blob) => {
+                    if (blob) {
+                        resolve(blob);
+                    } else {
+                        reject(new Error('Gagal mengambil gambar dari kamera.'));
+                    }
+                }, 'image/jpeg', 0.92);
+            });
+        }
+
+        async function captureBestBlob() {
+            const shots = [];
+            for (let i = 0; i < 3; i++) {
+                shots.push(await captureBlobOnce());
+                if (i < 2) await sleep(90);
+            }
+            // Heuristik ringan: ukuran blob cenderung lebih besar saat frame lebih tajam.
+            return shots.sort((a, b) => b.size - a.size)[0];
+        }
+
+        // Kalkulasi Matematika untuk Liveness
+        function distance(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+
+        function eyeAspectRatio(eyePoints) {
+            const p1 = eyePoints[0], p2 = eyePoints[1], p3 = eyePoints[2];
+            const p4 = eyePoints[3], p5 = eyePoints[4], p6 = eyePoints[5];
+            return (distance(p2, p6) + distance(p3, p5)) / (2 * distance(p1, p4));
+        }
+
+        function calcEAR(landmarks) {
+            const leftEAR = eyeAspectRatio(landmarks.getLeftEye());
+            const rightEAR = eyeAspectRatio(landmarks.getRightEye());
+            return (leftEAR + rightEAR) / 2;
+        }
+
+        function calcHeadYawRatio(landmarks) {
+            const jaw = landmarks.getJawOutline();
+            const nose = landmarks.getNose();
+            const leftJaw = jaw[0], rightJaw = jaw[16], noseTip = nose[3];
+            const faceWidth = Math.max(1, rightJaw.x - leftJaw.x);
+            return (noseTip.x - leftJaw.x) / faceWidth;
+        }
+
+        function calcSmileScore(landmarks) {
+            const mouth = landmarks.getMouth();
+            const mouthWidth = distance(mouth[0], mouth[6]);
+            const mouthHeight = distance(mouth[3], mouth[9]);
+            return mouthWidth / Math.max(1e-6, mouthHeight);
+        }
+
+        function drawGuideFrame(ctx, displaySize, isValid) {
+            const cx = displaySize.width / 2;
+            const cy = displaySize.height / 2;
+            const rx = displaySize.width * 0.20;
+            const ry = displaySize.height * 0.30;
+            ctx.save();
+            ctx.beginPath();
+            ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+            ctx.lineWidth = 3;
+            ctx.strokeStyle = isValid ? 'rgba(5, 150, 105, 0.95)' : 'rgba(251, 191, 36, 0.95)';
+            ctx.setLineDash([10, 6]);
+            ctx.stroke();
+            ctx.restore();
+        }
+
+        function evaluateFaceGuide(detection, displaySize) {
+            const box = detection.detection.box;
+            const faceCenterX = box.x + (box.width / 2);
+            const faceCenterY = box.y + (box.height / 2);
+            const dxRatio = Math.abs(faceCenterX - (displaySize.width / 2)) / displaySize.width;
+            const dyRatio = Math.abs(faceCenterY - (displaySize.height / 2)) / displaySize.height;
+            const isCentered = dxRatio <= GUIDE_CENTER_TOLERANCE_X && dyRatio <= GUIDE_CENTER_TOLERANCE_Y;
+
+            const widthRatio = box.width / displaySize.width;
+            const heightRatio = box.height / displaySize.height;
+            const isCloseUp = widthRatio >= GUIDE_MIN_FACE_WIDTH_RATIO && heightRatio >= GUIDE_MIN_FACE_HEIGHT_RATIO;
+
+            if (!isCentered) {
+                return { ok: false, reason: 'Posisikan wajah tepat di tengah frame panduan.' };
+            }
+            if (!isCloseUp) {
+                return { ok: false, reason: 'Dekatkan wajah (close-up) hingga memenuhi frame panduan.' };
+            }
+            return { ok: true, reason: '' };
+        }
+
+        async function ensureFaceReadyForCapture() {
+            const displaySize = { width: video.videoWidth, height: video.videoHeight };
+            for (let i = 0; i < GUIDE_CHECK_MAX_TRIES; i++) {
+                const detections = await faceapi.detectAllFaces(video, DETECTOR_OPTIONS).withFaceLandmarks();
+                if (detections.length === 1) {
+                    const guide = evaluateFaceGuide(detections[0], displaySize);
+                    if (guide.ok) {
+                        return;
+                    }
+                }
+                await sleep(80);
+            }
+            throw new Error('Wajah belum center & close-up. Posisikan wajah di tengah dan lebih dekat ke kamera.');
+        }
+
+        // API Call
+        async function uploadRegistrationSample(name) {
+            await ensureFaceReadyForCapture();
+            const imageBlob = await captureBestBlob();
+            const formData = new FormData();
+            formData.append('name', name);
+            formData.append('image', imageBlob, 'capture.jpg');
+
+            const response = await fetch(`${API_BASE_URL}/register`, {
+                method: 'POST',
+                body: formData
+            });
+            const data = await response.json();
+            if (!response.ok) {
+                throw new Error(data?.detail || 'Gagal menyimpan sampel wajah.');
+            }
+            return data;
+        }
+
+        function logMessage(msg, color = '#1f2937') {
+            logOutput.style.color = color;
+            if (typeof msg === 'object') {
+                logOutput.textContent = JSON.stringify(msg, null, 2);
+            } else {
+                logOutput.textContent = msg;
+            }
+        }
+
+        // 3. Logika Utama Liveness dengan Visual Feedback
+        async function runGuidedRegistration(name) {
+            let stage = 'blink';
+            let blinkState = 'wait_open';
+            let headBaseline = null;
+            let smileBaseline = null;
+            let absenceCounter = 0;
+            let multiFaceCounter = 0;
+            let guideMissCounter = 0;
+            let lastValidLandmarks = null;
+
+            const displaySize = { width: video.videoWidth, height: video.videoHeight };
+            faceapi.matchDimensions(canvas, displaySize);
+            const ctx = canvas.getContext('2d');
+            
+            instructionOverlay.style.display = 'block';
+
+            for (let i = 0; i < MAX_REGISTRATION_TRIES; i++) {
+                const detections = await faceapi.detectAllFaces(video, DETECTOR_OPTIONS).withFaceLandmarks();
+                
+                // Render Visual Feedback
+                const resizedDetections = faceapi.resizeResults(detections, displaySize);
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                faceapi.draw.drawDetections(canvas, resizedDetections);
+                faceapi.draw.drawFaceLandmarks(canvas, resizedDetections);
+
+                // Anti-Kecurangan / Validasi Orang
+                let landmarks = null;
+                if (detections.length === 1) {
+                    const guide = evaluateFaceGuide(detections[0], displaySize);
+                    drawGuideFrame(ctx, displaySize, guide.ok);
+                    if (!guide.ok) {
+                        guideMissCounter++;
+                        instructionOverlay.innerText = guide.reason;
+                        instructionOverlay.style.background = "rgba(217, 119, 6, 0.9)";
+                        if (guideMissCounter > FACE_RESET_FRAMES) {
+                            stage = 'blink';
+                            blinkState = 'wait_open';
+                            headBaseline = null;
+                            smileBaseline = null;
+                        }
+                        await sleep(80);
+                        continue;
+                    }
+                    guideMissCounter = 0;
+                    absenceCounter = 0;
+                    multiFaceCounter = 0;
+                    landmarks = detections[0].landmarks;
+                    lastValidLandmarks = landmarks;
+                } else if (detections.length > 1) {
+                    drawGuideFrame(ctx, displaySize, false);
+                    multiFaceCounter++;
+                    instructionOverlay.innerText = "Pastikan hanya 1 wajah terlihat jelas!";
+                    instructionOverlay.style.background = "rgba(220, 38, 38, 0.9)";
+                    if (multiFaceCounter > FACE_RESET_FRAMES) {
+                        stage = 'blink'; 
+                        blinkState = 'wait_open';
+                        headBaseline = null;
+                        smileBaseline = null;
+                    }
+                    await sleep(80);
+                    continue;
+                } else {
+                    drawGuideFrame(ctx, displaySize, false);
+                    absenceCounter++;
+                    if (lastValidLandmarks && absenceCounter <= FACE_MISSING_GRACE_FRAMES) {
+                        // Grace period: toleransi deteksi sesaat hilang (mis. saat berkedip/gerak)
+                        if (stage === 'blink' && blinkState === 'wait_close') {
+                            // Jika detector drop sesaat saat kedip, anggap fase mata tertutup sudah tercapai.
+                            blinkState = 'wait_open_again';
+                        }
+                        landmarks = lastValidLandmarks;
+                    } else {
+                        instructionOverlay.innerText = "Wajah tidak terdeteksi. Tatap kamera.";
+                        instructionOverlay.style.background = "rgba(217, 119, 6, 0.9)";
+                        if (absenceCounter > FACE_RESET_FRAMES) {
+                            stage = 'blink';
+                            blinkState = 'wait_open';
+                            headBaseline = null;
+                            smileBaseline = null;
+                        }
+                        await sleep(80);
+                        continue;
+                    }
+                }
+
+                instructionOverlay.style.background = "rgba(37, 99, 235, 0.9)"; // Biru Normal
+
+                // Alur Liveness
+                if (stage === 'blink') {
+                    const ear = calcEAR(landmarks);
+                    if (blinkState === 'wait_open') {
+                        instructionOverlay.innerText = 'Tahap 1: Buka mata normal, lalu KEDIP 1x';
+                        if (ear > EAR_OPEN) blinkState = 'wait_close';
+                    } else if (blinkState === 'wait_close') {
+                        if (ear < EAR_CLOSED) blinkState = 'wait_open_again';
+                    } else if (ear > EAR_OPEN) {
+                        instructionOverlay.innerText = 'Menyimpan tahap 1...';
+                        instructionOverlay.style.background = "rgba(5, 150, 105, 0.9)"; // Hijau Success
+                        await uploadRegistrationSample(name);
+                        stage = 'head';
+                        await sleep(500);
+                    }
+                } 
+                else if (stage === 'head') {
+                    const yawRatio = calcHeadYawRatio(landmarks);
+                    if (headBaseline === null) {
+                        headBaseline = yawRatio;
+                        instructionOverlay.innerText = 'Tahap 2: Putar kepala ke KIRI atau KANAN';
+                    } else if (Math.abs(yawRatio - headBaseline) >= HEAD_MOVE_THRESHOLD) {
+                        instructionOverlay.innerText = 'Menyimpan tahap 2...';
+                        instructionOverlay.style.background = "rgba(5, 150, 105, 0.9)";
+                        await uploadRegistrationSample(name);
+                        stage = 'smile';
+                        await sleep(500);
+                    }
+                } 
+                else if (stage === 'smile') {
+                    const smileScore = calcSmileScore(landmarks);
+                    if (smileBaseline === null) {
+                        smileBaseline = smileScore;
+                        instructionOverlay.innerText = 'Tahap 3: TERSENYUM lebar ke kamera';
+                    } else if (smileScore >= Math.max(smileBaseline * SMILE_GAIN, SMILE_MIN)) {
+                        instructionOverlay.innerText = 'Pendaftaran Selesai!';
+                        instructionOverlay.style.background = "rgba(5, 150, 105, 0.9)";
+                        const data = await uploadRegistrationSample(name);
+                        
+                        ctx.clearRect(0, 0, canvas.width, canvas.height);
+                        setTimeout(() => instructionOverlay.style.display = 'none', 1000);
+                        return data;
+                    }
+                }
+
+                await sleep(80); // Fast polling 80ms
+            }
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            instructionOverlay.style.display = 'none';
+            throw new Error('Waktu registrasi habis. Silakan coba lagi.');
+        }
+
+        // 4. Flow 1: Registrasi Wajah
+        btnRegister.addEventListener('click', async () => {
+            const name = inputName.value.trim();
+            if (!name) {
+                alert("Mohon masukkan nama terlebih dahulu!");
+                inputName.focus();
+                return;
+            }
+            if (!modelsReady) {
+                logMessage("Model FE belum siap. Mohon tunggu...", '#d97706');
+                return;
+            }
+
+            btnRegister.disabled = true;
+            btnRecognize.disabled = true;
+            logMessage(`Memulai registrasi liveness untuk "${name}"...`, '#2563eb');
+
+            try {
+                const data = await runGuidedRegistration(name);
+                logMessage(data, '#059669');
+                inputName.value = '';
+                alert(`Berhasil! Registrasi 3 tahap untuk ${name} selesai.`);
+            } catch (error) {
+                logMessage(error.message || "Registrasi gagal.", '#dc2626');
+            } finally {
+                btnRegister.disabled = false;
+                btnRecognize.disabled = false;
+            }
+        });
+
+        // 5. Flow 2: Identifikasi Wajah
+        btnRecognize.addEventListener('click', async () => {
+            btnRecognize.disabled = true;
+            btnRegister.disabled = true;
+            logMessage("Memindai wajah... Sedang mencocokkan dengan database.", '#d97706');
+
+            try {
+                await ensureFaceReadyForCapture();
+                const imageBlob = await captureBestBlob();
+                const formData = new FormData();
+                formData.append('image', imageBlob, 'capture.jpg');
+
+                const response = await fetch(`${API_BASE_URL}/recognize`, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const data = await response.json();
+                
+                if (response.ok) {
+                    if (data.match_found) {
+                        logMessage(`✅ IDENTITAS DIKENALI!\n\nNama: ${data.name}\nJarak (Kemiripan): ${data.distance}\nPesan: ${data.message}`, '#059669');
+                    } else {
+                        logMessage(`❌ IDENTITAS TIDAK DIKENALI.\n\nStatus: Unknown\nPesan: ${data.message}`, '#dc2626');
+                    }
+                } else {
+                    logMessage(data, '#dc2626');
+                }
+            } catch (error) {
+                logMessage(error.message || "Koneksi ke server gagal. Pastikan service berjalan.", '#dc2626');
+            } finally {
+                btnRecognize.disabled = false;
+                btnRegister.disabled = false;
+            }
+        });
+
+        // 6. Startup Initialization
+        window.addEventListener('load', async () => {
+            btnRegister.disabled = true;
+            btnRecognize.disabled = true;
+            logMessage("Inisialisasi kamera dan model FE...", '#2563eb');
+            try {
+                await startCamera();
+                await loadFaceApiModels();
+                logMessage("Sistem siap. Registrasi menggunakan challenge kedip, gerak kepala, dan senyum.", '#059669');
+            } catch (error) {
+                logMessage(`Gagal inisialisasi model FE: ${error.message}`, '#dc2626');
+            } finally {
+                btnRegister.disabled = !modelsReady;
+                btnRecognize.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>
