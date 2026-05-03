@@ -71,471 +71,270 @@
         </div>
     </div>
 
-    <!-- Pustaka face-api.js -->
     <script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
     <script>
-        // DOM Elements
-        const video = document.getElementById('video');
-        const canvas = document.getElementById('canvas');
-        const instructionOverlay = document.getElementById('instruction-overlay');
-        const btnRegister = document.getElementById('btn-register');
-        const btnRecognize = document.getElementById('btn-recognize');
-        const inputName = document.getElementById('input-name');
-        const logOutput = document.getElementById('log-output');
+        const el = {
+            video: document.getElementById('video'),
+            canvas: document.getElementById('canvas'),
+            overlay: document.getElementById('instruction-overlay'),
+            btnRegister: document.getElementById('btn-register'),
+            btnRecognize: document.getElementById('btn-recognize'),
+            inputName: document.getElementById('input-name'),
+            log: document.getElementById('log-output')
+        };
 
-        // Konfigurasi Sistem
-        const API_BASE_URL = '/api/v1';
-        const MODEL_URL = '/models';
-        const DETECTOR_OPTIONS = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.30 });
-        const MAX_REGISTRATION_TRIES = 300; // 300 iterasi x 80ms = ~24 detik maksimal
-        const EAR_CLOSED = 0.19;
-        const EAR_OPEN = 0.24;
-        const HEAD_MOVE_THRESHOLD = 0.08;
-        const SMILE_GAIN = 1.18;
-        const SMILE_MIN = 1.8;
-        const FACE_MISSING_GRACE_FRAMES = 12;
-        const FACE_RESET_FRAMES = 30;
-        const GUIDE_CENTER_TOLERANCE_X = 0.14;
-        const GUIDE_CENTER_TOLERANCE_Y = 0.18;
-        const GUIDE_MIN_FACE_WIDTH_RATIO = 0.34;
-        const GUIDE_MIN_FACE_HEIGHT_RATIO = 0.42;
-        const GUIDE_CHECK_MAX_TRIES = 30;
-        
+        const cfg = {
+            apiBaseUrl: '/api/v1',
+            modelUrl: '/models',
+            detector: new faceapi.SsdMobilenetv1Options({ minConfidence: 0.3 }),
+            maxLoop: 300,
+            intervalMs: 80,
+            blinkOpen: 0.24,
+            blinkClose: 0.19,
+            headMoveThreshold: 0.08,
+            smileGain: 1.18,
+            smileMin: 1.8,
+            centerTolX: 0.14,
+            centerTolY: 0.18,
+            minFaceWidthRatio: 0.34,
+            minFaceHeightRatio: 0.42
+        };
+
         let modelsReady = false;
-        let cameraReady = false;
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-        function sleep(ms) {
-            return new Promise((resolve) => setTimeout(resolve, ms));
+        function logMessage(msg, color = '#1f2937') {
+            el.log.style.color = color;
+            el.log.textContent = typeof msg === 'object' ? JSON.stringify(msg, null, 2) : msg;
         }
 
-        // 1. Inisialisasi Kamera
+        function setOverlay(text, color = 'rgba(37, 99, 235, 0.9)', visible = true) {
+            el.overlay.style.display = visible ? 'block' : 'none';
+            el.overlay.style.background = color;
+            el.overlay.innerText = text;
+        }
+
         async function startCamera() {
-            try {
-                const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
-                video.srcObject = stream;
-                await new Promise((resolve) => {
-                    if (video.readyState >= 1) {
-                        resolve();
-                        return;
-                    }
-                    video.onloadedmetadata = () => resolve();
-                });
-                cameraReady = true;
-            } catch (err) {
-                logOutput.textContent = "Error: Kamera tidak dapat diakses.\n" + err.message;
-                logOutput.style.color = 'red';
-            }
+            const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+            el.video.srcObject = stream;
+            await new Promise((resolve) => {
+                if (el.video.readyState >= 1) return resolve();
+                el.video.onloadedmetadata = resolve;
+            });
         }
 
-        async function loadFaceApiModels() {
-            await verifyFaceApiModelFiles();
+        async function loadModels() {
             await Promise.all([
-                faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL),
-                faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL)
+                faceapi.nets.ssdMobilenetv1.loadFromUri(cfg.modelUrl),
+                faceapi.nets.faceLandmark68Net.loadFromUri(cfg.modelUrl)
             ]);
             modelsReady = true;
         }
 
-        async function fetchManifest(manifestFile) {
-            const response = await fetch(`${MODEL_URL}/${manifestFile}`, { cache: 'no-store' });
-            if (!response.ok) {
-                throw new Error(`File model tidak ditemukan: ${manifestFile}`);
-            }
-            return response.json();
+        function getDisplaySize() {
+            return { width: el.video.videoWidth, height: el.video.videoHeight };
         }
 
-        async function verifyFaceApiModelFiles() {
-            const manifests = [
-                'ssd_mobilenetv1_model-weights_manifest.json',
-                'face_landmark_68_model-weights_manifest.json'
-            ];
-            const missingFiles = [];
-
-            for (const manifestFile of manifests) {
-                const groups = await fetchManifest(manifestFile);
-                for (const group of groups) {
-                    const shardPaths = Array.isArray(group.paths) ? group.paths : [];
-                    for (const shardPath of shardPaths) {
-                        const shardUrl = `${MODEL_URL}/${shardPath}`;
-                        const shardResponse = await fetch(shardUrl, { method: 'HEAD', cache: 'no-store' });
-                        if (!shardResponse.ok) {
-                            missingFiles.push(shardPath);
-                        }
-                    }
-                }
-            }
-
-            if (missingFiles.length > 0) {
-                throw new Error(
-                    `File shard model belum lengkap: ${missingFiles.join(', ')}. ` +
-                    `Pastikan semua file shard face-api.js ada di folder /models.`
-                );
-            }
-        }
-
-        // 2. Helper: Tangkap Frame dari Video menjadi Blob
-        async function captureBlobOnce() {
-            if (!cameraReady || video.videoWidth === 0 || video.videoHeight === 0) {
-                throw new Error('Kamera belum siap.');
-            }
-            // Gunakan canvas temporer untuk memotret bersih (tanpa garis panduan)
-            const tempCanvas = document.createElement('canvas');
-            tempCanvas.width = video.videoWidth;
-            tempCanvas.height = video.videoHeight;
-            const ctx = tempCanvas.getContext('2d');
-            ctx.drawImage(video, 0, 0, tempCanvas.width, tempCanvas.height);
-            
-            return new Promise((resolve, reject) => {
-                tempCanvas.toBlob((blob) => {
-                    if (blob) {
-                        resolve(blob);
-                    } else {
-                        reject(new Error('Gagal mengambil gambar dari kamera.'));
-                    }
-                }, 'image/jpeg', 0.92);
-            });
-        }
-
-        async function captureBestBlob() {
-            const shots = [];
-            for (let i = 0; i < 3; i++) {
-                shots.push(await captureBlobOnce());
-                if (i < 2) await sleep(90);
-            }
-            // Heuristik ringan: ukuran blob cenderung lebih besar saat frame lebih tajam.
-            return shots.sort((a, b) => b.size - a.size)[0];
-        }
-
-        // Kalkulasi Matematika untuk Liveness
-        function distance(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
-
-        function eyeAspectRatio(eyePoints) {
-            const p1 = eyePoints[0], p2 = eyePoints[1], p3 = eyePoints[2];
-            const p4 = eyePoints[3], p5 = eyePoints[4], p6 = eyePoints[5];
-            return (distance(p2, p6) + distance(p3, p5)) / (2 * distance(p1, p4));
-        }
-
-        function calcEAR(landmarks) {
-            const leftEAR = eyeAspectRatio(landmarks.getLeftEye());
-            const rightEAR = eyeAspectRatio(landmarks.getRightEye());
-            return (leftEAR + rightEAR) / 2;
-        }
-
-        function calcHeadYawRatio(landmarks) {
-            const jaw = landmarks.getJawOutline();
-            const nose = landmarks.getNose();
-            const leftJaw = jaw[0], rightJaw = jaw[16], noseTip = nose[3];
-            const faceWidth = Math.max(1, rightJaw.x - leftJaw.x);
-            return (noseTip.x - leftJaw.x) / faceWidth;
-        }
-
-        function calcSmileScore(landmarks) {
-            const mouth = landmarks.getMouth();
-            const mouthWidth = distance(mouth[0], mouth[6]);
-            const mouthHeight = distance(mouth[3], mouth[9]);
-            return mouthWidth / Math.max(1e-6, mouthHeight);
-        }
-
-        function drawGuideFrame(ctx, displaySize, isValid) {
-            const cx = displaySize.width / 2;
-            const cy = displaySize.height / 2;
-            const rx = displaySize.width * 0.20;
-            const ry = displaySize.height * 0.30;
+        function drawGuide(ctx, size, valid) {
+            const cx = size.width / 2;
+            const cy = size.height / 2;
             ctx.save();
             ctx.beginPath();
-            ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+            ctx.ellipse(cx, cy, size.width * 0.2, size.height * 0.3, 0, 0, Math.PI * 2);
             ctx.lineWidth = 3;
-            ctx.strokeStyle = isValid ? 'rgba(5, 150, 105, 0.95)' : 'rgba(251, 191, 36, 0.95)';
+            ctx.strokeStyle = valid ? 'rgba(5,150,105,0.95)' : 'rgba(251,191,36,0.95)';
             ctx.setLineDash([10, 6]);
             ctx.stroke();
             ctx.restore();
         }
 
-        function evaluateFaceGuide(detection, displaySize) {
+        function faceGuideStatus(detection, size) {
             const box = detection.detection.box;
-            const faceCenterX = box.x + (box.width / 2);
-            const faceCenterY = box.y + (box.height / 2);
-            const dxRatio = Math.abs(faceCenterX - (displaySize.width / 2)) / displaySize.width;
-            const dyRatio = Math.abs(faceCenterY - (displaySize.height / 2)) / displaySize.height;
-            const isCentered = dxRatio <= GUIDE_CENTER_TOLERANCE_X && dyRatio <= GUIDE_CENTER_TOLERANCE_Y;
-
-            const widthRatio = box.width / displaySize.width;
-            const heightRatio = box.height / displaySize.height;
-            const isCloseUp = widthRatio >= GUIDE_MIN_FACE_WIDTH_RATIO && heightRatio >= GUIDE_MIN_FACE_HEIGHT_RATIO;
-
-            if (!isCentered) {
-                return { ok: false, reason: 'Posisikan wajah tepat di tengah frame panduan.' };
-            }
-            if (!isCloseUp) {
-                return { ok: false, reason: 'Dekatkan wajah (close-up) hingga memenuhi frame panduan.' };
-            }
-            return { ok: true, reason: '' };
+            const cx = box.x + (box.width / 2);
+            const cy = box.y + (box.height / 2);
+            const centered =
+                Math.abs(cx - (size.width / 2)) / size.width <= cfg.centerTolX &&
+                Math.abs(cy - (size.height / 2)) / size.height <= cfg.centerTolY;
+            const closeUp = (box.width / size.width) >= cfg.minFaceWidthRatio &&
+                (box.height / size.height) >= cfg.minFaceHeightRatio;
+            if (!centered) return { ok: false, message: 'Posisikan wajah tepat di tengah frame panduan.' };
+            if (!closeUp) return { ok: false, message: 'Dekatkan wajah (close-up) hingga memenuhi frame panduan.' };
+            return { ok: true, message: '' };
         }
 
-        async function ensureFaceReadyForCapture() {
-            const displaySize = { width: video.videoWidth, height: video.videoHeight };
-            for (let i = 0; i < GUIDE_CHECK_MAX_TRIES; i++) {
-                const detections = await faceapi.detectAllFaces(video, DETECTOR_OPTIONS).withFaceLandmarks();
-                if (detections.length === 1) {
-                    const guide = evaluateFaceGuide(detections[0], displaySize);
-                    if (guide.ok) {
-                        return;
-                    }
-                }
-                await sleep(80);
-            }
-            throw new Error('Wajah belum center & close-up. Posisikan wajah di tengah dan lebih dekat ke kamera.');
+        const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+        function calcEar(landmarks) {
+            const ratio = (eye) => (distance(eye[1], eye[5]) + distance(eye[2], eye[4])) / (2 * distance(eye[0], eye[3]));
+            return (ratio(landmarks.getLeftEye()) + ratio(landmarks.getRightEye())) / 2;
+        }
+        function calcYaw(landmarks) {
+            const jaw = landmarks.getJawOutline();
+            const noseTip = landmarks.getNose()[3];
+            return (noseTip.x - jaw[0].x) / Math.max(1, jaw[16].x - jaw[0].x);
+        }
+        function calcSmile(landmarks) {
+            const mouth = landmarks.getMouth();
+            return distance(mouth[0], mouth[6]) / Math.max(1e-6, distance(mouth[3], mouth[9]));
         }
 
-        // API Call
-        async function uploadRegistrationSample(name) {
-            await ensureFaceReadyForCapture();
-            const imageBlob = await captureBestBlob();
+        async function captureBestBlob() {
+            const snap = () => {
+                const c = document.createElement('canvas');
+                c.width = el.video.videoWidth;
+                c.height = el.video.videoHeight;
+                c.getContext('2d').drawImage(el.video, 0, 0, c.width, c.height);
+                return new Promise((resolve, reject) =>
+                    c.toBlob((blob) => blob ? resolve(blob) : reject(new Error('Gagal capture kamera.')), 'image/jpeg', 0.92)
+                );
+            };
+            const shots = [await snap(), await snap(), await snap()];
+            return shots.sort((a, b) => b.size - a.size)[0];
+        }
+
+        async function postImage(path, name) {
             const formData = new FormData();
-            formData.append('name', name);
-            formData.append('image', imageBlob, 'capture.jpg');
-
-            const response = await fetch(`${API_BASE_URL}/register`, {
-                method: 'POST',
-                body: formData
-            });
-            const data = await response.json();
-            if (!response.ok) {
-                throw new Error(data?.detail || 'Gagal menyimpan sampel wajah.');
-            }
+            formData.append('image', await captureBestBlob(), 'capture.jpg');
+            if (name) formData.append('name', name);
+            const res = await fetch(`${cfg.apiBaseUrl}/${path}`, { method: 'POST', body: formData });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data?.detail || 'Request gagal.');
             return data;
         }
 
-        function logMessage(msg, color = '#1f2937') {
-            logOutput.style.color = color;
-            if (typeof msg === 'object') {
-                logOutput.textContent = JSON.stringify(msg, null, 2);
-            } else {
-                logOutput.textContent = msg;
+        async function detectSingleWithGuide(ctx, size) {
+            const detections = await faceapi.detectAllFaces(el.video, cfg.detector).withFaceLandmarks();
+            const resized = faceapi.resizeResults(detections, size);
+            ctx.clearRect(0, 0, el.canvas.width, el.canvas.height);
+            faceapi.draw.drawDetections(el.canvas, resized);
+            faceapi.draw.drawFaceLandmarks(el.canvas, resized);
+            if (detections.length !== 1) {
+                drawGuide(ctx, size, false);
+                return { ok: false, reason: detections.length > 1 ? 'Pastikan hanya 1 wajah terlihat jelas!' : 'Wajah tidak terdeteksi. Tatap kamera.' };
             }
+            const guide = faceGuideStatus(detections[0], size);
+            drawGuide(ctx, size, guide.ok);
+            return guide.ok ? { ok: true, landmarks: detections[0].landmarks } : { ok: false, reason: guide.message };
         }
 
-        // 3. Logika Utama Liveness dengan Visual Feedback
         async function runGuidedRegistration(name) {
+            const size = getDisplaySize();
+            faceapi.matchDimensions(el.canvas, size);
+            const ctx = el.canvas.getContext('2d');
+            setOverlay('Mulai challenge registrasi...');
+
             let stage = 'blink';
-            let blinkState = 'wait_open';
-            let headBaseline = null;
-            let smileBaseline = null;
-            let absenceCounter = 0;
-            let multiFaceCounter = 0;
-            let guideMissCounter = 0;
-            let lastValidLandmarks = null;
+            let blinkState = 'waitOpen';
+            let headBase = null;
+            let smileBase = null;
 
-            const displaySize = { width: video.videoWidth, height: video.videoHeight };
-            faceapi.matchDimensions(canvas, displaySize);
-            const ctx = canvas.getContext('2d');
-            
-            instructionOverlay.style.display = 'block';
-
-            for (let i = 0; i < MAX_REGISTRATION_TRIES; i++) {
-                const detections = await faceapi.detectAllFaces(video, DETECTOR_OPTIONS).withFaceLandmarks();
-                
-                // Render Visual Feedback
-                const resizedDetections = faceapi.resizeResults(detections, displaySize);
-                ctx.clearRect(0, 0, canvas.width, canvas.height);
-                faceapi.draw.drawDetections(canvas, resizedDetections);
-                faceapi.draw.drawFaceLandmarks(canvas, resizedDetections);
-
-                // Anti-Kecurangan / Validasi Orang
-                let landmarks = null;
-                if (detections.length === 1) {
-                    const guide = evaluateFaceGuide(detections[0], displaySize);
-                    drawGuideFrame(ctx, displaySize, guide.ok);
-                    if (!guide.ok) {
-                        guideMissCounter++;
-                        instructionOverlay.innerText = guide.reason;
-                        instructionOverlay.style.background = "rgba(217, 119, 6, 0.9)";
-                        if (guideMissCounter > FACE_RESET_FRAMES) {
-                            stage = 'blink';
-                            blinkState = 'wait_open';
-                            headBaseline = null;
-                            smileBaseline = null;
-                        }
-                        await sleep(80);
-                        continue;
-                    }
-                    guideMissCounter = 0;
-                    absenceCounter = 0;
-                    multiFaceCounter = 0;
-                    landmarks = detections[0].landmarks;
-                    lastValidLandmarks = landmarks;
-                } else if (detections.length > 1) {
-                    drawGuideFrame(ctx, displaySize, false);
-                    multiFaceCounter++;
-                    instructionOverlay.innerText = "Pastikan hanya 1 wajah terlihat jelas!";
-                    instructionOverlay.style.background = "rgba(220, 38, 38, 0.9)";
-                    if (multiFaceCounter > FACE_RESET_FRAMES) {
-                        stage = 'blink'; 
-                        blinkState = 'wait_open';
-                        headBaseline = null;
-                        smileBaseline = null;
-                    }
-                    await sleep(80);
+            for (let i = 0; i < cfg.maxLoop; i++) {
+                const state = await detectSingleWithGuide(ctx, size);
+                if (!state.ok) {
+                    setOverlay(state.reason, 'rgba(217,119,6,0.9)');
+                    await sleep(cfg.intervalMs);
                     continue;
-                } else {
-                    drawGuideFrame(ctx, displaySize, false);
-                    absenceCounter++;
-                    if (lastValidLandmarks && absenceCounter <= FACE_MISSING_GRACE_FRAMES) {
-                        // Grace period: toleransi deteksi sesaat hilang (mis. saat berkedip/gerak)
-                        if (stage === 'blink' && blinkState === 'wait_close') {
-                            // Jika detector drop sesaat saat kedip, anggap fase mata tertutup sudah tercapai.
-                            blinkState = 'wait_open_again';
-                        }
-                        landmarks = lastValidLandmarks;
-                    } else {
-                        instructionOverlay.innerText = "Wajah tidak terdeteksi. Tatap kamera.";
-                        instructionOverlay.style.background = "rgba(217, 119, 6, 0.9)";
-                        if (absenceCounter > FACE_RESET_FRAMES) {
-                            stage = 'blink';
-                            blinkState = 'wait_open';
-                            headBaseline = null;
-                            smileBaseline = null;
-                        }
-                        await sleep(80);
-                        continue;
-                    }
                 }
 
-                instructionOverlay.style.background = "rgba(37, 99, 235, 0.9)"; // Biru Normal
-
-                // Alur Liveness
+                const landmarks = state.landmarks;
                 if (stage === 'blink') {
-                    const ear = calcEAR(landmarks);
-                    if (blinkState === 'wait_open') {
-                        instructionOverlay.innerText = 'Tahap 1: Buka mata normal, lalu KEDIP 1x';
-                        if (ear > EAR_OPEN) blinkState = 'wait_close';
-                    } else if (blinkState === 'wait_close') {
-                        if (ear < EAR_CLOSED) blinkState = 'wait_open_again';
-                    } else if (ear > EAR_OPEN) {
-                        instructionOverlay.innerText = 'Menyimpan tahap 1...';
-                        instructionOverlay.style.background = "rgba(5, 150, 105, 0.9)"; // Hijau Success
-                        await uploadRegistrationSample(name);
+                    const ear = calcEar(landmarks);
+                    setOverlay('Tahap 1: Kedip 1x');
+                    if (blinkState === 'waitOpen' && ear > cfg.blinkOpen) blinkState = 'waitClose';
+                    else if (blinkState === 'waitClose' && ear < cfg.blinkClose) blinkState = 'waitOpenAgain';
+                    else if (blinkState === 'waitOpenAgain' && ear > cfg.blinkOpen) {
+                        setOverlay('Menyimpan tahap 1...', 'rgba(5,150,105,0.9)');
+                        await postImage('register', name);
                         stage = 'head';
-                        await sleep(500);
+                        await sleep(400);
                     }
-                } 
-                else if (stage === 'head') {
-                    const yawRatio = calcHeadYawRatio(landmarks);
-                    if (headBaseline === null) {
-                        headBaseline = yawRatio;
-                        instructionOverlay.innerText = 'Tahap 2: Putar kepala ke KIRI atau KANAN';
-                    } else if (Math.abs(yawRatio - headBaseline) >= HEAD_MOVE_THRESHOLD) {
-                        instructionOverlay.innerText = 'Menyimpan tahap 2...';
-                        instructionOverlay.style.background = "rgba(5, 150, 105, 0.9)";
-                        await uploadRegistrationSample(name);
+                } else if (stage === 'head') {
+                    const yaw = calcYaw(landmarks);
+                    setOverlay('Tahap 2: Gerakkan kepala kiri/kanan');
+                    if (headBase === null) headBase = yaw;
+                    else if (Math.abs(yaw - headBase) >= cfg.headMoveThreshold) {
+                        setOverlay('Menyimpan tahap 2...', 'rgba(5,150,105,0.9)');
+                        await postImage('register', name);
                         stage = 'smile';
-                        await sleep(500);
+                        await sleep(400);
                     }
-                } 
-                else if (stage === 'smile') {
-                    const smileScore = calcSmileScore(landmarks);
-                    if (smileBaseline === null) {
-                        smileBaseline = smileScore;
-                        instructionOverlay.innerText = 'Tahap 3: TERSENYUM lebar ke kamera';
-                    } else if (smileScore >= Math.max(smileBaseline * SMILE_GAIN, SMILE_MIN)) {
-                        instructionOverlay.innerText = 'Pendaftaran Selesai!';
-                        instructionOverlay.style.background = "rgba(5, 150, 105, 0.9)";
-                        const data = await uploadRegistrationSample(name);
-                        
-                        ctx.clearRect(0, 0, canvas.width, canvas.height);
-                        setTimeout(() => instructionOverlay.style.display = 'none', 1000);
+                } else {
+                    const smile = calcSmile(landmarks);
+                    setOverlay('Tahap 3: Tersenyum');
+                    if (smileBase === null) smileBase = smile;
+                    else if (smile >= Math.max(smileBase * cfg.smileGain, cfg.smileMin)) {
+                        setOverlay('Menyimpan tahap 3...', 'rgba(5,150,105,0.9)');
+                        const data = await postImage('register', name);
+                        setOverlay('Registrasi selesai!', 'rgba(5,150,105,0.9)');
+                        setTimeout(() => setOverlay('', '', false), 900);
                         return data;
                     }
                 }
-
-                await sleep(80); // Fast polling 80ms
+                await sleep(cfg.intervalMs);
             }
-
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            instructionOverlay.style.display = 'none';
-            throw new Error('Waktu registrasi habis. Silakan coba lagi.');
+            setOverlay('', '', false);
+            throw new Error('Waktu registrasi habis. Coba lagi.');
         }
 
-        // 4. Flow 1: Registrasi Wajah
-        btnRegister.addEventListener('click', async () => {
-            const name = inputName.value.trim();
-            if (!name) {
-                alert("Mohon masukkan nama terlebih dahulu!");
-                inputName.focus();
-                return;
-            }
-            if (!modelsReady) {
-                logMessage("Model FE belum siap. Mohon tunggu...", '#d97706');
-                return;
-            }
+        function setBusy(busy) {
+            el.btnRegister.disabled = busy || !modelsReady;
+            el.btnRecognize.disabled = busy;
+        }
 
-            btnRegister.disabled = true;
-            btnRecognize.disabled = true;
-            logMessage(`Memulai registrasi liveness untuk "${name}"...`, '#2563eb');
-
+        el.btnRegister.addEventListener('click', async () => {
+            const name = el.inputName.value.trim();
+            if (!name) return el.inputName.focus();
+            if (!modelsReady) return logMessage('Model FE belum siap.', '#d97706');
+            setBusy(true);
             try {
                 const data = await runGuidedRegistration(name);
                 logMessage(data, '#059669');
-                inputName.value = '';
-                alert(`Berhasil! Registrasi 3 tahap untuk ${name} selesai.`);
-            } catch (error) {
-                logMessage(error.message || "Registrasi gagal.", '#dc2626');
+                el.inputName.value = '';
+            } catch (e) {
+                logMessage(e.message || 'Registrasi gagal.', '#dc2626');
             } finally {
-                btnRegister.disabled = false;
-                btnRecognize.disabled = false;
+                setBusy(false);
             }
         });
 
-        // 5. Flow 2: Identifikasi Wajah
-        btnRecognize.addEventListener('click', async () => {
-            btnRecognize.disabled = true;
-            btnRegister.disabled = true;
-            logMessage("Memindai wajah... Sedang mencocokkan dengan database.", '#d97706');
-
+        el.btnRecognize.addEventListener('click', async () => {
+            if (!modelsReady) return logMessage('Model FE belum siap.', '#d97706');
+            setBusy(true);
             try {
-                await ensureFaceReadyForCapture();
-                const imageBlob = await captureBestBlob();
-                const formData = new FormData();
-                formData.append('image', imageBlob, 'capture.jpg');
-
-                const response = await fetch(`${API_BASE_URL}/recognize`, {
-                    method: 'POST',
-                    body: formData
-                });
-
-                const data = await response.json();
-                
-                if (response.ok) {
-                    if (data.match_found) {
-                        logMessage(`✅ IDENTITAS DIKENALI!\n\nNama: ${data.name}\nJarak (Kemiripan): ${data.distance}\nPesan: ${data.message}`, '#059669');
-                    } else {
-                        logMessage(`❌ IDENTITAS TIDAK DIKENALI.\n\nStatus: Unknown\nPesan: ${data.message}`, '#dc2626');
-                    }
-                } else {
-                    logMessage(data, '#dc2626');
+                const size = getDisplaySize();
+                faceapi.matchDimensions(el.canvas, size);
+                const ctx = el.canvas.getContext('2d');
+                for (let i = 0; i < 30; i++) {
+                    const state = await detectSingleWithGuide(ctx, size);
+                    if (state.ok) break;
+                    setOverlay(state.reason, 'rgba(217,119,6,0.9)');
+                    if (i === 29) throw new Error('Wajah belum center & close-up.');
+                    await sleep(cfg.intervalMs);
                 }
-            } catch (error) {
-                logMessage(error.message || "Koneksi ke server gagal. Pastikan service berjalan.", '#dc2626');
+                const data = await postImage('recognize');
+                setOverlay('', '', false);
+                if (data.match_found) {
+                    logMessage(`✅ IDENTITAS DIKENALI!\n\nNama: ${data.name}\nJarak: ${data.distance}\nPesan: ${data.message}`, '#059669');
+                } else {
+                    logMessage(`❌ IDENTITAS TIDAK DIKENALI.\n\nPesan: ${data.message}`, '#dc2626');
+                }
+            } catch (e) {
+                logMessage(e.message || 'Pengenalan gagal.', '#dc2626');
             } finally {
-                btnRecognize.disabled = false;
-                btnRegister.disabled = false;
+                setBusy(false);
             }
         });
 
-        // 6. Startup Initialization
         window.addEventListener('load', async () => {
-            btnRegister.disabled = true;
-            btnRecognize.disabled = true;
-            logMessage("Inisialisasi kamera dan model FE...", '#2563eb');
+            setBusy(true);
+            logMessage('Inisialisasi kamera dan model FE...', '#2563eb');
             try {
                 await startCamera();
-                await loadFaceApiModels();
-                logMessage("Sistem siap. Registrasi menggunakan challenge kedip, gerak kepala, dan senyum.", '#059669');
-            } catch (error) {
-                logMessage(`Gagal inisialisasi model FE: ${error.message}`, '#dc2626');
+                await loadModels();
+                logMessage('Sistem siap.', '#059669');
+            } catch (e) {
+                logMessage(`Gagal inisialisasi: ${e.message}`, '#dc2626');
             } finally {
-                btnRegister.disabled = !modelsReady;
-                btnRecognize.disabled = false;
+                setBusy(false);
             }
         });
     </script>

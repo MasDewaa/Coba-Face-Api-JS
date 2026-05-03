@@ -19,8 +19,7 @@ from pathlib import Path
 from psycopg2 import OperationalError, pool
 
 BASE_DIR = Path(__file__).resolve().parent
-# DATABASE_URL = os.getenv("DATABASE_URL")
-DATABASE_URL = "postgresql://root:1234@127.0.0.1:32768/facedb"
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://faceapp:facepass@localhost:5432/facedb")
 FACE_MATCH_THRESHOLD = 0.62
 FACE_VECTOR_DIM = 512
 MAX_IMAGE_BYTES = 3 * 1024 * 1024
