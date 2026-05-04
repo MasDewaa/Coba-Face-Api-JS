@@ -7,7 +7,7 @@ services:
     restart: unless-stopped
     environment:
       - TZ=Asia/Jakarta
-      - DATABASE_URL=postgresql://faceapp:facepass@db:5432/facedb
+      - DATABASE_URL=postgresql://root:1234@localhost:32768/facedb
     depends_on:
       db:
         condition: service_healthy
